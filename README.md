@@ -59,6 +59,7 @@ pip install -r requirements.txt
 
 3. Повторите установку:
 
+
    ```bash
    pip install -r requirements.txt
    ```
