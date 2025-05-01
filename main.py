@@ -1,12 +1,15 @@
+import gzip
 import os
-import codecs
 import argparse
 import shutil
 import urllib
 import zipfile
 from io import BytesIO
+
+import brotli
 import requests
 import bs4
+import zstandard as zstd
 
 parser = argparse.ArgumentParser(usage="easy4us", description="decode directories with easytoyou.eu")
 parser.add_argument("-u", "--username", required=True, help="easytoyou.eu username")
@@ -17,11 +20,36 @@ parser.add_argument("-d", "--decoder", help="decoder (default: ic10php72)", defa
 parser.add_argument("-w", "--overwrite", help="overwrite", action='store_true', default=False)
 base_url = "https://easytoyou.eu"
 args = parser.parse_args()
-
-headers = {"Connection": "close",
-           "Cache-Control": "max-age=0",
-           "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.30 Safari/537.36",
-           "Origin": "https://easytoyou.eu"}
+# ------------------------------------------------------------------
+# Единый набор заголовков под "современный Chrome 124"
+# ------------------------------------------------------------------
+headers = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,de;q=0.7,uk;q=0.6,bg;q=0.5",
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Sec-CH-UA": '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "Origin": "https://easytoyou.eu",
+    "Referer": f"https://easytoyou.eu/decoder/{args.decoder}",
+    # Content-Type автоматически добавится requests (multipart/form-data с boundary)
+    # Cookie автоматически подставляется через session
+}
 
 not_decoded = []
 
@@ -30,8 +58,7 @@ def login(username, password):
     session = requests.session()
     login = base_url + "/login"
     login_data = {"loginname": username, "password": password}
-    resp = session.post(login, headers=dict(headers, **{"Content-Type": "application/x-www-form-urlencoded"}),
-                        data=login_data, allow_redirects=True)
+    resp = session.post(login, headers=dict(headers, **{"Content-Type": "application/x-www-form-urlencoded"}), data=login_data, allow_redirects=True)
     if "/account" in resp.url:
         return session
     return False
@@ -62,7 +89,7 @@ def clear(session):
         session.post(base_url + "/decoder/%s/1" % args.decoder, data=final,
                      headers=dict(headers, **{"Content-Type": "application/x-www-form-urlencoded"}))
         print("...%d" % c, end='')
-        
+
         # print("deleted %s files" % len(inputs))
 
 
@@ -81,25 +108,67 @@ def parse_upload_result(r):
     return success, failure
 
 
+def decode_response_bytes(data: bytes, encoding: str) -> str:
+    try:
+        if encoding == 'zstd' and data.startswith(b'\x28\xb5\x2f\xfd'):
+            dctx = zstd.ZstdDecompressor()
+            with dctx.stream_reader(BytesIO(data)) as reader:
+                decompressed = reader.read()
+                return decompressed.decode('utf-8', errors='replace')
+        elif encoding == 'gzip' and data.startswith(b'\x1f\x8b'):
+            return gzip.decompress(data).decode('utf-8', errors='replace')
+        elif encoding == 'br':
+            return brotli.decompress(data).decode('utf-8', errors='replace')
+        else:
+            return data.decode('utf-8', errors='replace')
+    except Exception as e:
+        return f"Ошибка декодирования: {e}"
+
+
 def upload(session, dir, files):
-    r = session.get(base_url + "/decoder/%s" % args.decoder, headers=headers, timeout=300)
-    s = bs4.BeautifulSoup(r.content, features="lxml")
-    el = s.find(id="uploadfileblue")
+    url = f"{base_url}/decoder/{args.decoder}"
+    print(f"[GET] {url}")
+
+    r = session.get(url, headers=headers, timeout=300)
+    encoding = r.headers.get("Content-Encoding", "").lower()
+    html = decode_response_bytes(r.content, encoding)
+
+    # # Сохраним HTML для отладки
+    # with open("decoder_form.html", "w", encoding="utf-8") as f:
+    #     f.write(html)
+
+    s = bs4.BeautifulSoup(html, features="lxml")
+    el = s.find("input", {"type": "file"})
     if not el:
-        print(s.text)
-        print("error: couldnt find upload form")
+        print("❌ Upload form not found. См. decoder_form.html")
         return
+
     n = el.attrs["name"]
     upload = []
     for file in files:
         if file.endswith(".php"):
-            full = codecs.open(os.path.join(dir, file), 'rb')
+            full = open(os.path.join(dir, file), 'rb')
             upload.append((n, (file, full, "application/x-php")))
+
     upload.append(("submit", (None, "Decode")))
-    if len(upload) > 0:
-        r = session.post(base_url + "/decoder/%s" % args.decoder,
-                         headers=headers,
-                         files=upload)
+
+    if upload:
+        post_headers = dict(headers)
+        post_headers.update({
+            "Referer": url,
+            "Origin": "https://easytoyou.eu"
+        })
+
+        print(f"[POST] uploading {len(files)} files to {url}")
+        r = session.post(url, headers=post_headers, files=upload)
+
+        encoding = r.headers.get("Content-Encoding", "").lower()
+        html = decode_response_bytes(r.content, encoding)
+
+        # для отладки — можно сохранить POST-ответ
+        # with open("upload_result.html", "w", encoding="utf-8") as f:
+        #     f.write(html)
+
         return parse_upload_result(r)
 
 
@@ -150,6 +219,7 @@ def process_files(session, dir, dest, phpfiles):
                 not_decoded.extend([os.path.join(dir, f) for f in phpfiles])
             clear(session)
 
+
 if __name__ == '__main__':
     if args.destination == "":
         args.destination = os.path.basename(args.source) + "_decoded"
@@ -182,7 +252,7 @@ if __name__ == '__main__':
                     csrc = os.path.join(dest, f)
                     if not os.path.exists(csrc):
                         needed.append(f)
-                    #else:
+                    # else:
                     #    print("%s exists already. skipping." % f)
                 phpfiles = needed
 
